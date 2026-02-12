@@ -114,6 +114,8 @@ class Builder extends \Illuminate\Database\Schema\Builder
         if ($callback) {
             $callback($blueprint);
         }
+
+        $blueprint->applyColumnSchemas();
     }
 
     /** @inheritdoc */
@@ -127,6 +129,8 @@ class Builder extends \Illuminate\Database\Schema\Builder
         if ($callback) {
             $callback($blueprint);
         }
+
+        $blueprint->applyColumnSchemas();
     }
 
     /** @inheritdoc */
