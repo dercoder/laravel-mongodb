@@ -10,9 +10,11 @@ use MongoDB\BSON\Binary;
 use MongoDB\BSON\UTCDateTime;
 use MongoDB\Collection;
 use MongoDB\Database;
+use MongoDB\Driver\Exception\BulkWriteException;
 use MongoDB\Laravel\Schema\Blueprint;
 use MongoDB\Model\IndexInfo;
 
+use function array_map;
 use function assert;
 use function collect;
 use function count;
@@ -612,8 +614,8 @@ class SchemaTest extends TestCase
                 'unique' => false,
             ],
             [
-                'name' => 'unique_index_1',
-                'columns' => ['unique_index'],
+                'name' => 'unique_index',
+                'columns' => ['mykey2'],
                 'primary' => false,
                 'type' => null,
                 'unique' => true,
@@ -691,6 +693,562 @@ class SchemaTest extends TestCase
 
         $index = $this->getSearchIndex(self::COLL_1, 'vector');
         self::assertNull($index);
+    }
+
+    public function testStringColumnCreatesJsonSchema(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('username');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('object', $schema['bsonType']);
+        $this->assertArrayHasKey('username', $schema['properties']);
+        $this->assertSame('string', $schema['properties']['username']['bsonType']);
+        $this->assertSame(255, $schema['properties']['username']['maxLength']);
+        $this->assertContains('username', $schema['required']);
+    }
+
+    public function testStringColumnWithCustomLength(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name', 100);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame(100, $schema['properties']['name']['maxLength']);
+    }
+
+    public function testNullableStringColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name')->nullable();
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertArrayHasKey('name', $schema['properties']);
+        // nullable should add "null" to bsonType and remove from required
+        $this->assertNotContains('name', $schema['required'] ?? []);
+    }
+
+    public function testMultipleStringColumns(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('first_name');
+            $collection->string('last_name');
+            $collection->string('email', 320);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertCount(3, $schema['properties']);
+        $this->assertSame(255, $schema['properties']['first_name']['maxLength']);
+        $this->assertSame(255, $schema['properties']['last_name']['maxLength']);
+        $this->assertSame(320, $schema['properties']['email']['maxLength']);
+        $this->assertContains('first_name', $schema['required']);
+        $this->assertContains('last_name', $schema['required']);
+        $this->assertContains('email', $schema['required']);
+    }
+
+    public function testDropColumnRemovesDataAndSchema(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name');
+            $collection->string('email');
+        });
+
+        // Insert test data using MongoDB collection directly
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['name' => 'John', 'email' => 'john@example.com']);
+
+        // Drop a column
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn('name');
+        });
+
+        // Verify schema no longer has the column
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertArrayNotHasKey('name', $schema['properties']);
+        $this->assertArrayHasKey('email', $schema['properties']);
+        $this->assertNotContains('name', $schema['required'] ?? []);
+        $this->assertContains('email', $schema['required']);
+
+        // Verify data was removed
+        $doc = $collection->findOne();
+        $this->assertArrayNotHasKey('name', (array) $doc);
+        $this->assertArrayHasKey('email', (array) $doc);
+    }
+
+    public function testDropMultipleColumns(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('a');
+            $collection->string('b');
+            $collection->string('c');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['a' => '1', 'b' => '2', 'c' => '3']);
+
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn(['a', 'b']);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertArrayNotHasKey('a', $schema['properties']);
+        $this->assertArrayNotHasKey('b', $schema['properties']);
+        $this->assertArrayHasKey('c', $schema['properties']);
+
+        $doc = $collection->findOne();
+        $this->assertArrayNotHasKey('a', (array) $doc);
+        $this->assertArrayNotHasKey('b', (array) $doc);
+        $this->assertArrayHasKey('c', (array) $doc);
+    }
+
+    public function testDropColumnWithoutSchema(): void
+    {
+        Schema::create(self::COLL_1);
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['name' => 'John', 'age' => 30]);
+
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn('name');
+        });
+
+        $doc = $collection->findOne();
+        $this->assertArrayNotHasKey('name', (array) $doc);
+        $this->assertArrayHasKey('age', (array) $doc);
+    }
+
+    public function testAddColumnToExistingCollection(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name');
+        });
+
+        // Insert existing data
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['name' => 'John']);
+
+        // Add a new column via Schema::table
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('email', 320);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertArrayHasKey('name', $schema['properties']);
+        $this->assertArrayHasKey('email', $schema['properties']);
+        $this->assertSame(320, $schema['properties']['email']['maxLength']);
+
+        // Existing data should be untouched
+        $doc = $collection->findOne();
+        $this->assertSame('John', $doc->name);
+    }
+
+    public function testSchemaValidationRejectsInvalidData(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+
+        // Inserting a non-string value should fail
+        $this->expectException(BulkWriteException::class);
+        $collection->insertOne(['name' => 12345]);
+    }
+
+    public function testArrayColumnOfStrings(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'string');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('array', $schema['properties']['tags']['bsonType']);
+        $this->assertSame(['bsonType' => 'string', 'maxLength' => 255], $schema['properties']['tags']['items']);
+        $this->assertContains('tags', $schema['required']);
+    }
+
+    public function testArrayColumnOfIntegers(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('scores', 'int');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('array', $schema['properties']['scores']['bsonType']);
+        // 'int' is not yet mapped, falls back to default 'string'
+        $this->assertSame(['bsonType' => 'string'], $schema['properties']['scores']['items']);
+    }
+
+    public function testArrayColumnOfObjects(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('metadata', 'object');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('array', $schema['properties']['metadata']['bsonType']);
+        $this->assertSame(['bsonType' => 'object'], $schema['properties']['metadata']['items']);
+    }
+
+    public function testNullableArrayColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'string')->nullable();
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame(['array', 'null'], $schema['properties']['tags']['bsonType']);
+        $this->assertNotContains('tags', $schema['required'] ?? []);
+    }
+
+    public function testArrayColumnValidatesItemType(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'string');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+
+        // Valid: array of strings
+        $collection->insertOne(['tags' => ['php', 'laravel']]);
+
+        // Invalid: array containing a non-string
+        $this->expectException(BulkWriteException::class);
+        $collection->insertOne(['tags' => [123, 456]]);
+    }
+
+    public function testDropArrayColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('name');
+            $collection->array('tags', 'string');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['name' => 'John', 'tags' => ['a', 'b']]);
+
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn('tags');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertArrayNotHasKey('tags', $schema['properties']);
+        $this->assertArrayHasKey('name', $schema['properties']);
+
+        $doc = $collection->findOne();
+        $this->assertArrayNotHasKey('tags', (array) $doc);
+    }
+
+    public function testDropNestedObjectProperty(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->object('address');
+            $collection->string('address.street');
+            $collection->string('address.city');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne(['address' => ['street' => '123 Main St', 'city' => 'NYC']]);
+
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn('address.city');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // 'city' removed from schema, 'street' remains
+        $this->assertArrayNotHasKey('city', $schema['properties']['address']['properties']);
+        $this->assertArrayHasKey('street', $schema['properties']['address']['properties']);
+        $this->assertNotContains('city', $schema['properties']['address']['required']);
+        $this->assertContains('street', $schema['properties']['address']['required']);
+
+        // 'city' removed from document data
+        $doc = $collection->findOne();
+        $address = (array) $doc->address;
+        $this->assertArrayNotHasKey('city', $address);
+        $this->assertSame('123 Main St', $address['street']);
+    }
+
+    public function testDropArrayWildcardProperty(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'object');
+            $collection->string('tags.*.name');
+            $collection->string('tags.*.value')->nullable();
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+        $collection->insertOne([
+            'tags' => [
+                ['name' => 'color', 'value' => 'red'],
+                ['name' => 'size', 'value' => 'large'],
+            ],
+        ]);
+
+        Schema::table(self::COLL_1, function (Blueprint $collection) {
+            $collection->dropColumn('tags.*.value');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // 'value' removed from items schema, 'name' remains
+        $items = $schema['properties']['tags']['items'];
+        $this->assertArrayNotHasKey('value', $items['properties']);
+        $this->assertArrayHasKey('name', $items['properties']);
+        $this->assertNotContains('value', $items['required'] ?? []);
+
+        // 'value' removed from all array elements
+        $doc = $collection->findOne();
+        $tags = array_map(fn ($t) => (array) $t, (array) $doc->tags);
+        $this->assertArrayNotHasKey('value', $tags[0]);
+        $this->assertArrayNotHasKey('value', $tags[1]);
+        $this->assertSame('color', $tags[0]['name']);
+        $this->assertSame('size', $tags[1]['name']);
+    }
+
+    public function testSetColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->set('roles', ['admin', 'user', 'editor']);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('array', $schema['properties']['roles']['bsonType']);
+        $this->assertSame(
+            ['bsonType' => 'string', 'enum' => ['admin', 'user', 'editor']],
+            $schema['properties']['roles']['items'],
+        );
+    }
+
+    public function testObjectColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->object('address');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('object', $schema['properties']['address']['bsonType']);
+        $this->assertContains('address', $schema['required']);
+    }
+
+    public function testNullableObjectColumn(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->object('meta')->nullable();
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame(['object', 'null'], $schema['properties']['meta']['bsonType']);
+        $this->assertNotContains('meta', $schema['required'] ?? []);
+    }
+
+    public function testObjectWithNestedProperties(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->object('address');
+            $collection->string('address.street');
+            $collection->string('address.city')->nullable();
+            $collection->string('address.zip', 10);
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // Root level: address is required
+        $this->assertContains('address', $schema['required']);
+        $this->assertSame('object', $schema['properties']['address']['bsonType']);
+
+        // Nested properties
+        $address = $schema['properties']['address'];
+        $this->assertSame('string', $address['properties']['street']['bsonType']);
+        $this->assertSame(255, $address['properties']['street']['maxLength']);
+        $this->assertSame(['string', 'null'], $address['properties']['city']['bsonType']);
+        $this->assertSame(10, $address['properties']['zip']['maxLength']);
+
+        // Nested required: street and zip are required, city is not
+        $this->assertContains('street', $address['required']);
+        $this->assertContains('zip', $address['required']);
+        $this->assertNotContains('city', $address['required']);
+    }
+
+    public function testNestedPropertiesWithoutExplicitObject(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('address.street');
+            $collection->string('address.city');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // address should be auto-created as an object
+        $this->assertSame('object', $schema['properties']['address']['bsonType']);
+
+        // Nested properties should exist
+        $address = $schema['properties']['address'];
+        $this->assertSame('string', $address['properties']['street']['bsonType']);
+        $this->assertSame('string', $address['properties']['city']['bsonType']);
+        $this->assertContains('street', $address['required']);
+        $this->assertContains('city', $address['required']);
+    }
+
+    public function testDeeplyNestedProperties(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('a.b.c');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $this->assertSame('object', $schema['properties']['a']['bsonType']);
+        $this->assertSame('object', $schema['properties']['a']['properties']['b']['bsonType']);
+        $this->assertSame('string', $schema['properties']['a']['properties']['b']['properties']['c']['bsonType']);
+        $this->assertContains('c', $schema['properties']['a']['properties']['b']['required']);
+    }
+
+    public function testNestedPropertyValidation(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->object('address');
+            $collection->string('address.city');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+
+        // Valid: nested string
+        $collection->insertOne(['address' => ['city' => 'Amsterdam']]);
+
+        // Invalid: nested value is not a string
+        $this->expectException(BulkWriteException::class);
+        $collection->insertOne(['address' => ['city' => 12345]]);
+    }
+
+    public function testArrayWildcardDefinesObjectProperties(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'object');
+            $collection->string('tags.*.name');
+            $collection->string('tags.*.value', 100)->nullable();
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // Root: tags is an array
+        $this->assertSame('array', $schema['properties']['tags']['bsonType']);
+        $this->assertContains('tags', $schema['required']);
+
+        // Items: object with properties
+        $items = $schema['properties']['tags']['items'];
+        $this->assertSame('object', $items['bsonType']);
+        $this->assertSame('string', $items['properties']['name']['bsonType']);
+        $this->assertSame(255, $items['properties']['name']['maxLength']);
+        $this->assertSame(['string', 'null'], $items['properties']['value']['bsonType']);
+        $this->assertSame(100, $items['properties']['value']['maxLength']);
+
+        // Required scoped to items
+        $this->assertContains('name', $items['required']);
+        $this->assertNotContains('value', $items['required']);
+    }
+
+    public function testArrayWildcardWithoutExplicitArray(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->string('items.*.label');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        // 'items' is auto-created as an object (since we don't know it's an array without explicit declaration)
+        $this->assertArrayHasKey('items', $schema['properties']);
+
+        // The wildcard navigates into items.items (the JSON Schema 'items' key)
+        $itemsSchema = $schema['properties']['items'];
+        $this->assertSame('object', $itemsSchema['items']['bsonType']);
+        $this->assertSame('string', $itemsSchema['items']['properties']['label']['bsonType']);
+    }
+
+    public function testArrayWildcardValidation(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('tags', 'object');
+            $collection->string('tags.*.name');
+        });
+
+        $collection = $this->getConnection('mongodb')->getCollection(self::COLL_1);
+        assert($collection instanceof Collection);
+
+        // Valid: array of objects with string name
+        $collection->insertOne(['tags' => [['name' => 'php'], ['name' => 'laravel']]]);
+
+        // Invalid: name is not a string
+        $this->expectException(BulkWriteException::class);
+        $collection->insertOne(['tags' => [['name' => 123]]]);
+    }
+
+    public function testNestedObjectInsideArrayWildcard(): void
+    {
+        Schema::create(self::COLL_1, function (Blueprint $collection) {
+            $collection->array('people', 'object');
+            $collection->object('people.*.address');
+            $collection->string('people.*.address.city');
+        });
+
+        $collectionInfo = Schema::getCollection(self::COLL_1);
+        $schema = $collectionInfo['options']['validator']['$jsonSchema'];
+
+        $items = $schema['properties']['people']['items'];
+        $this->assertSame('object', $items['bsonType']);
+        $this->assertSame('object', $items['properties']['address']['bsonType']);
+        $this->assertSame('string', $items['properties']['address']['properties']['city']['bsonType']);
+        $this->assertContains('city', $items['properties']['address']['required']);
     }
 
     protected function assertIndexExists(string $collection, string $name): IndexInfo
